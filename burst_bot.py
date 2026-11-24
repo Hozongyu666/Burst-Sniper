@@ -7,7 +7,6 @@ from datetime import datetime, timezone, timedelta
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import mplfinance as mpf
 
 import ccxt
 import numpy as np
@@ -15,19 +14,22 @@ import pandas as pd
 import requests
 
 # ==========================================
-# 1. 爆擊流核心設定區（獨立系統，不影響主趨勢雷達）
+# 1. MEXC 爆擊流核心設定區
 # ==========================================
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 FORCE_TEST = os.environ.get("FORCE_TEST", "false").strip().lower() == "true"
 
 TW_TZ = timezone(timedelta(hours=8))       # 台灣時區 (UTC+8)
-STATE_FILE = "burst_state.json"            # 獨立狀態檔（記錄1小時觸發次數與冷卻）
+STATE_FILE = "burst_state.json"            # 獨立狀態檔（記錄1小時觸發次數與持倉量基線）
 
-# 觸發門檻（對照 0xDrag 10/12 補充規則：1小時漲幅 10% UP + 觸發 3~5 次星星關注）
+# 觸發門檻（1小時漲幅 10% UP + 1小時內異常脈衝 >= 3 次出星星）
 MIN_1H_GAIN_PCT = 10.0                     # 1小時漲幅門檻：>= +10.0%
 MIN_1H_TRIGGER_COUNT = 3                   # 1小時內異常脈衝觸發次數：>= 3 次（出星星）
 PULSE_3M_GAIN_PCT = 1.2                    # 單根 3m 漲幅 >= +1.2% 視為一次異常脈衝
 PULSE_3M_VOL_MULT = 2.8                    # 或單根 3m 量能 >= 2.8 倍均量視為一次異常脈衝
+
+# MEXC 小市值妖幣流動性門檻（24H 成交額至少 30 萬 U，過濾完全無量殭屍幣）
+MIN_24H_TURNOVER_USDT = 300_000
 
 # 倉位參考（小倉位逐倉博高R：損 3~4 單，吃一次 TP 起大飛）
 SAMPLE_MARGIN_USDT = 15.0                  # 單筆逐倉保證金參考：15U
@@ -36,15 +38,6 @@ SAMPLE_LEVERAGE = 10                       # 建議逐倉槓桿：10x
 BLACKLIST_BASE = {
     "USDC", "FDUSD", "TUSD", "USDP", "EUR", "USD1", "DAI", "XAUT", "PAXG"
 }
-VALID_X_CRYPTO = {"XRP", "XLM", "XTZ", "XMR", "XEC", "XDC", "XAI", "XCH", "XRD", "XVS"}
-
-
-def is_excluded_base(base: str) -> bool:
-    if base in BLACKLIST_BASE:
-        return True
-    if base.startswith("X") and base not in VALID_X_CRYPTO:
-        return True
-    return False
 
 
 def now_tw() -> datetime:
@@ -74,13 +67,14 @@ def format_price(p: float) -> str:
 
 
 # ==========================================
-# 2. 狀態讀寫（維護滾動 1 小時觸發次數計數器）
+# 2. 狀態讀寫（維護滾動 1 小時觸發次數與持倉量基線）
 # ==========================================
 def load_state() -> dict:
     default = {
-        "trigger_timestamps": {},   # sym -> [ts1, ts2, ...] 記錄過去1小時內脈衝時間戳
+        "trigger_timestamps": {},   # sym -> [ts1, ts2, ...] 過去1小時脈衝時間戳
         "alert_history": {},        # sym -> {"last_alert_ts": float, "last_alert_count": int}
-        "prev_tickers": {},         # sym -> {"price": float, "vol": float, "ts": float}
+        "prev_tickers": {},         # sym -> {"price": float, "oi": float, "ts": float}
+        "oi_baseline": {},          # sym -> {"oi": float, "ts": float} 約30分鐘前持倉量基線
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -96,7 +90,6 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     now = time.time()
-    # 只保留過去 65 分鐘內的觸發時間戳
     cleaned_triggers = {}
     for sym, ts_list in state.get("trigger_timestamps", {}).items():
         valid = [t for t in ts_list if now - t <= 3900]
@@ -108,18 +101,38 @@ def save_state(state: dict):
         k: v for k, v in state.get("alert_history", {}).items()
         if now - v.get("last_alert_ts", 0) <= 86400
     }
+    state["oi_baseline"] = {
+        k: v for k, v in state.get("oi_baseline", {}).items()
+        if now - v.get("ts", 0) <= 7200
+    }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
 # ==========================================
-# 3. 爆擊流全套指標計算（BOLL + KDJ + MACD + StochRSI）
+# 3. 1m 合成 3m K 線 ＋ 爆擊流全套指標計算
 # ==========================================
+def resample_1m_to_3m(ohlcv_1m: list) -> pd.DataFrame:
+    df_1m = pd.DataFrame(ohlcv_1m, columns=["ts", "open", "high", "low", "close", "volume"])
+    df_1m["dt"] = pd.to_datetime(df_1m["ts"], unit="ms")
+    df_1m = df_1m.set_index("dt")
+
+    df_3m = df_1m.resample("3min", closed="left", label="left").agg({
+        "ts": "first",
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna().reset_index(drop=True)
+    return df_3m
+
+
 def compute_burst_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    close, high, low, open_, vol = df["close"], df["high"], df["low"], df["open"], df["volume"]
+    close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
 
-    # 1. 布林帶 BOLL (20, 2) —— 爆擊流最核心指標
+    # 1. 布林帶 BOLL (20, 2)
     df["boll_mid"] = close.rolling(20).mean()
     std20 = close.rolling(20).std()
     df["boll_upper"] = df["boll_mid"] + 2.0 * std20
@@ -139,8 +152,7 @@ def compute_burst_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 4. KDJ (9, 3, 3)
     low_9 = low.rolling(9).min()
     high_9 = high.rolling(9).max()
-    rsv = (close - low_9) / (high_9 - low_9).replace(0, np.nan) * 100.0
-    rsv = rsv.fillna(50.0)
+    rsv = ((close - low_9) / (high_9 - low_9).replace(0, np.nan) * 100.0).fillna(50.0)
     df["kdj_k"] = rsv.ewm(com=2, adjust=False).mean()
     df["kdj_d"] = df["kdj_k"].ewm(com=2, adjust=False).mean()
     df["kdj_j"] = 3.0 * df["kdj_k"] - 2.0 * df["kdj_d"]
@@ -160,52 +172,31 @@ def compute_burst_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==========================================
-# 4. 查詢 OKX 永續合約持倉量 (OI) 激增幅度
-# ==========================================
-def fetch_oi_surge_pct(inst_id: str) -> float | None:
-    try:
-        resp = requests.get(
-            "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history",
-            params={"instId": inst_id, "period": "5m", "limit": "6"},
-            timeout=5,
-        ).json()
-        rows = resp.get("data", [])
-        if len(rows) >= 4:
-            cur_oi = float(rows[0][2])
-            old_oi = float(rows[3][2])  # 對比 15 分鐘前持倉量
-            if old_oi > 0:
-                return (cur_oi - old_oi) / old_oi * 100.0
-    except Exception:
-        pass
-    return None
-
-
-# ==========================================
-# 5. 分析單一幣種是否符合「爆擊流」進場與看盤條件
+# 4. 分析單一 MEXC 合約是否符合爆擊流進場與看盤條件
 # ==========================================
 def analyze_burst_coin(
     symbol: str,
-    inst_id: str,
+    mexc_pair: str,
     df_3m: pd.DataFrame,
     df_15m: pd.DataFrame,
     df_1h: pd.DataFrame,
     trigger_count_1h: int,
+    oi_chg_pct: float | None,
+    funding_pct: float | None,
 ) -> dict:
-    # --- A. 1小時大格局檢驗（計算 1H 開盤價、漲幅、是否實體真漲） ---
+    # --- A. 1小時大格局檢驗（計算 1H 開盤價、漲幅、實體真漲 vs 拉高出貨） ---
     bar_1h = df_1h.iloc[-1]
     prev_1h = df_1h.iloc[-2]
-    # 取最近 60 分鐘起始參考價（若當根 1H 剛開盤不到 20 分鐘，則與前一根 1H 開盤比較）
     open_1h = float(bar_1h["open"])
     cur_price = float(df_3m.iloc[-1]["close"])
     gain_1h_pct = (cur_price - open_1h) / open_1h * 100.0
 
-    # 若當根 1H 漲幅不足，檢查過去完整 1 小時（對比 prev_1h open）的滾動漲幅
+    # 兼顧跨整點時的滾動 1 小時漲幅
     rolling_gain_1h = (cur_price - float(prev_1h["open"])) / float(prev_1h["open"]) * 100.0
     if rolling_gain_1h > gain_1h_pct and gain_1h_pct < MIN_1H_GAIN_PCT:
         open_1h = float(prev_1h["open"])
         gain_1h_pct = rolling_gain_1h
 
-    # 1H 真漲 vs 拉高出貨檢驗（看實體與上影線比例）
     range_1h = float(bar_1h["high"]) - float(bar_1h["low"])
     upper_wick_1h = float(bar_1h["high"]) - max(float(bar_1h["open"]), cur_price)
     wick_ratio_1h = (upper_wick_1h / range_1h) if range_1h > 0 else 0.0
@@ -215,7 +206,7 @@ def analyze_burst_coin(
     elif wick_ratio_1h > 0.45:
         h1_verdict = "⚠️ 1H留長上影線，慎防拉高出貨，嚴禁追高"
     else:
-        h1_verdict = "⚡ 1H多頭推進中（留意下小時回踩影線）"
+        h1_verdict = "⚡ 1H多頭推進中（留意下小時回踩下影線）"
 
     # --- B. 3m 布林帶位置與「掛中軌進場 / 中軌下前低 SL」精算 ---
     live_3m = df_3m.iloc[-1]
@@ -224,7 +215,6 @@ def analyze_burst_coin(
     boll_mid = float(live_3m["boll_mid"])
     boll_low = float(live_3m["boll_lower"])
 
-    # 偵測 3m 是否出現下影線 Pinbar 反轉訊號
     body_3m = abs(float(live_3m["close"]) - float(live_3m["open"]))
     lower_wick_3m = min(float(live_3m["close"]), float(live_3m["open"])) - float(live_3m["low"])
     is_pinbar_mid = (
@@ -241,17 +231,16 @@ def analyze_burst_coin(
         entry_action = "🎯 現價正處於 3m 布林中軌附近，可直接市價或貼近中軌進場！"
         suggested_entry = boll_mid
     elif cur_price >= boll_up * 0.995:
-        entry_action = "🧗 正沿 3m 布林上軌攀爬（勿直接追高，請在下方「紅色線：3m布林中軌」掛限價單等回踩）"
+        entry_action = "🧗 正沿 3m 布林上軌攀爬（勿追高，請在下方「紅色線：3m布林中軌」掛限價單等回踩）"
         suggested_entry = boll_mid
     else:
         entry_action = "⏳ 位於中上軌之間，建議掛單在「紅色線：3m布林中軌」等待回踩接針"
         suggested_entry = boll_mid
 
-    # 計算止損位 SL：中軌下方的近 8 根 3m 前低 K 棒，並參考布林下軌
+    # 止損位 SL：中軌下方近 8 根 3m 前低 K 棒，並參考布林下軌
     recent_swing_low = float(df_3m["low"].iloc[-8:].min())
     sl_price = min(recent_swing_low * 0.997, boll_low * 0.998)
     sl_pct = (suggested_entry - sl_price) / suggested_entry
-    # 保護止損寬度在 1.5% ~ 5.5% 之間，符合 10x 逐倉不易被插針掃掉又能高 R 爆發
     if sl_pct < 0.015:
         sl_price = suggested_entry * (1 - 0.015)
         sl_pct = 0.015
@@ -259,20 +248,16 @@ def analyze_burst_coin(
         sl_price = suggested_entry * (1 - 0.055)
         sl_pct = 0.055
 
-    # 15m 支撐健康檢查（0xDrag：如果跌破中軌或下軌，看 5分 15分，都跌破就不用做）
+    # 15m 支撐健康檢查
     live_15m = df_15m.iloc[-1]
     m15_ok = cur_price > float(live_15m["boll_lower"])
     m15_status = "✅ 15m 位於布林帶支撐之上（結構有效）" if m15_ok else "❌ 已跌破 15m 布林下軌（建議放棄不做）"
 
-    # 輔助指標狀態（KDJ / MACD / StochRSI）
     kdj_str = f"K:{live_3m['kdj_k']:.0f} D:{live_3m['kdj_d']:.0f} J:{live_3m['kdj_j']:.0f}"
     macd_str = "多頭紅柱擴大" if live_3m["macd_hist"] > prev_3m["macd_hist"] and live_3m["macd_hist"] > 0 else "動能整理"
     srsi_str = f"{live_3m['stoch_k']:.0f}/{live_3m['stoch_d']:.0f}"
 
-    # 查詢 15 分鐘持倉量 (OI) 激增幅度
-    oi_15m_chg = fetch_oi_surge_pct(inst_id)
-
-    # 高 R 止盈計算（3R / 5R / 8R —— 吃一次 TP 起大飛）
+    # 高 R 止盈計算（3R / 5R / 8R）
     risk_unit = suggested_entry - sl_price
     tp_3r = suggested_entry + 3.0 * risk_unit
     tp_5r = suggested_entry + 5.0 * risk_unit
@@ -284,7 +269,6 @@ def analyze_burst_coin(
     win_5r_u = notional * (sl_pct * 5.0) - notional * 0.001
     win_8r_u = notional * (sl_pct * 8.0) - notional * 0.001
 
-    # 星級評等（對照截圖：3~9次一顆星 ⭐，10次以上兩顆星 ⭐⭐）
     if trigger_count_1h >= 10:
         stars = "⭐⭐"
     elif trigger_count_1h >= 3:
@@ -294,7 +278,7 @@ def analyze_burst_coin(
 
     return {
         "symbol": symbol,
-        "inst_id": inst_id,
+        "mexc_pair": mexc_pair,
         "gain_1h_pct": gain_1h_pct,
         "trigger_count_1h": trigger_count_1h,
         "stars": stars,
@@ -320,12 +304,13 @@ def analyze_burst_coin(
         "kdj_str": kdj_str,
         "macd_str": macd_str,
         "srsi_str": srsi_str,
-        "oi_15m_chg": oi_15m_chg,
+        "oi_chg_pct": oi_chg_pct,
+        "funding_pct": funding_pct,
     }
 
 
 # ==========================================
-# 6. 生成雙視角看盤圖表（左 1H 辨真假 ＋ 右 3m 布林中軌紅線/SL綠線）
+# 5. 生成雙視角看盤圖表（左 1H 辨真假 ＋ 右 3m 布林中軌紅線/SL綠線）
 # ==========================================
 def generate_dual_chart(df_1h: pd.DataFrame, df_3m: pd.DataFrame, info: dict) -> io.BytesIO:
     plt.style.use("dark_background")
@@ -340,24 +325,20 @@ def generate_dual_chart(df_1h: pd.DataFrame, df_3m: pd.DataFrame, info: dict) ->
         up = sub["close"] >= sub["open"]
         down = ~up
 
-        # 畫影線
         ax.vlines(x[up], sub["low"][up], sub["high"][up], color="#26a69a", linewidth=1.0)
         ax.vlines(x[down], sub["low"][down], sub["high"][down], color="#ef5350", linewidth=1.0)
 
-        # 畫 K 棒實體
         heights = np.maximum(np.abs(sub["close"] - sub["open"]), (sub["high"] - sub["low"]) * 0.02)
         bottoms = np.minimum(sub["open"], sub["close"])
         ax.bar(x[up], heights[up], bottom=bottoms[up], width=0.6, color="#26a69a", edgecolor="#26a69a")
         ax.bar(x[down], heights[down], bottom=bottoms[down], width=0.6, color="#ef5350", edgecolor="#ef5350")
 
-        # 畫布林帶 BOLL (上軌/中軌/下軌)
         ax.plot(x, sub["boll_upper"], color="#f1c40f", linewidth=1.1, label="BOLL Upper")
         ax.plot(x, sub["boll_mid"], color="#e056fd", linewidth=1.2, label="BOLL Mid (中軌)")
         ax.plot(x, sub["boll_lower"], color="#00d2d3", linewidth=1.1, label="BOLL Lower")
         ax.fill_between(x, sub["boll_lower"], sub["boll_upper"], color="#9b59b6", alpha=0.06)
 
         if draw_levels:
-            # 復刻 0xDrag 截圖：紅色線 = 可進場掛單位置（3m布林中軌），綠色線 = SL 止損位置
             entry_p = info["suggested_entry"]
             sl_p = info["sl_price"]
             ax.axhline(entry_p, color="#ff3b30", linestyle="-", linewidth=1.6, label=f"進場掛單 {format_price(entry_p)}")
@@ -374,7 +355,6 @@ def generate_dual_chart(df_1h: pd.DataFrame, df_3m: pd.DataFrame, info: dict) ->
                 bbox=dict(boxstyle="round,pad=0.2", facecolor="#00e676", edgecolor="none"),
             )
 
-        # 設定 X 軸台灣時間刻度
         tick_idx = np.linspace(0, len(sub) - 1, 5, dtype=int)
         tick_labels = [
             (pd.to_datetime(sub["ts"].iloc[i], unit="ms") + pd.Timedelta(hours=8)).strftime("%H:%M")
@@ -386,11 +366,12 @@ def generate_dual_chart(df_1h: pd.DataFrame, df_3m: pd.DataFrame, info: dict) ->
         ax.set_title(title, color="white", fontsize=10, fontweight="bold", pad=8)
         ax.legend(loc="upper left", facecolor="#2b2d31", edgecolor="#3f4147", fontsize=7.5)
 
-    plot_candles_with_boll(ax1, df_1h, f"1H K線（辨別實體真漲 vs 拉高出貨）", draw_levels=False)
-    plot_candles_with_boll(ax2, df_3m, f"3m K線（紅線=布林中軌掛單 / 綠線=SL止損）", draw_levels=True)
+    plot_candles_with_boll(ax1, df_1h, "1H K線（辨別實體真漲 vs 拉高出貨）", draw_levels=False)
+    plot_candles_with_boll(ax2, df_3m, "3m K線（紅線=布林中軌掛單 / 綠線=SL止損）", draw_levels=True)
 
+    clean_pair = info["mexc_pair"].replace("_", "")
     plt.suptitle(
-        f"{info['inst_id']} | 1H漲幅: {info['gain_1h_pct']:+.2f}% | 1H觸發: {info['trigger_count_1h']}次 {info['stars']} | TW {info['trigger_time_tw']}",
+        f"MEXC {clean_pair} | 1H漲幅: {info['gain_1h_pct']:+.2f}% | 1H觸發: {info['trigger_count_1h']}次 {info['stars']} | TW {info['trigger_time_tw']}",
         color="#f1c40f",
         fontsize=11,
         fontweight="bold",
@@ -408,17 +389,24 @@ def generate_dual_chart(df_1h: pd.DataFrame, df_3m: pd.DataFrame, info: dict) ->
 
 
 # ==========================================
-# 7. Discord 推播（完全復刻「異常上漲」通知卡片格式）
+# 6. Discord 推播（附 MEXC 合約直達連結）
 # ==========================================
 def send_burst_discord_alert(info: dict, df_1h: pd.DataFrame, df_3m: pd.DataFrame):
     if not DISCORD_WEBHOOK_URL:
         print("❌ 未設定 DISCORD_WEBHOOK_URL")
         return
 
-    clean_pair = info["inst_id"].replace("-USDT-SWAP", "USDT")
-    oi_line = f" ｜ 📈 15m持倉激增：`{info['oi_15m_chg']:+.1f}%`" if info["oi_15m_chg"] is not None else ""
+    clean_pair = info["mexc_pair"].replace("_", "")
+    mexc_url = f"https://futures.mexc.com/exchange/{info['mexc_pair']}"
 
-    # 完全復刻截圖頂部的「異常上漲」核心數據區塊
+    extra_tags = []
+    if info["oi_chg_pct"] is not None and abs(info["oi_chg_pct"]) >= 1.0:
+        extra_tags.append(f"🐋 持倉量變化: `{info['oi_chg_pct']:+.1f}%`")
+    if info["funding_pct"] is not None:
+        fr_note = "🔥軋空燃料" if info["funding_pct"] <= -0.01 else "費率"
+        extra_tags.append(f"💸 {fr_note}: `{info['funding_pct']:+.4f}%`")
+    meta_line = (" ｜ ".join(extra_tags) + "\n") if extra_tags else ""
+
     core_box = (
         f"```\n"
         f"1小時漲幅：{info['gain_1h_pct']:+.2f} %\n"
@@ -430,13 +418,14 @@ def send_burst_discord_alert(info: dict, df_1h: pd.DataFrame, df_3m: pd.DataFram
     )
 
     embed = {
-        "title": f"📈 異常上漲 | {clean_pair} | 合約",
+        "title": f"📈 異常上漲 | {clean_pair} | MEXC合約",
         "description": (
             f"{core_box}"
-            f"🔍 **1H 體檢**：{info['h1_verdict']}{oi_line}\n"
+            f"{meta_line}"
+            f"🔍 **1H 體檢**：{info['h1_verdict']}\n"
             f"🧭 **15m 支撐**：{info['m15_status']}\n"
             f"💡 **操作指引**：{info['entry_action']}\n"
-            f"📊 [立即開啟 TradingView 切 1m/3m 盯盤](https://www.tradingview.com/chart/?symbol=OKX:{clean_pair}.P)"
+            f"🚀 **[點此直接開啟 MEXC {clean_pair} 合約下單]({mexc_url})**"
         ),
         "color": 0xFF3B30 if info["trigger_count_1h"] >= 10 else 0xF1C40F,
         "fields": [
@@ -471,16 +460,16 @@ def send_burst_discord_alert(info: dict, df_1h: pd.DataFrame, df_3m: pd.DataFram
             },
         ],
         "image": {"url": "attachment://burst_chart.png"},
-        "footer": {"text": "爆擊流異常波動雷達 • 嚴禁無腦滿倉，務必等回踩3m中軌＋嚴格設SL"},
+        "footer": {"text": "MEXC 爆擊流異常波動雷達 • 等回踩3m中軌掛單＋嚴格設SL"},
     }
 
-    payload = {"username": "異常漲跌波動雷達 (爆擊流)", "embeds": [embed]}
+    payload = {"username": "MEXC 異常漲跌波動雷達 (爆擊流)", "embeds": [embed]}
     try:
         chart_buf = generate_dual_chart(df_1h, df_3m, info)
         files = {"file": ("burst_chart.png", chart_buf, "image/png")}
         resp = requests.post(DISCORD_WEBHOOK_URL, data={"payload_json": json.dumps(payload)}, files=files, timeout=15)
         if resp.status_code in (200, 204):
-            print(f"🚨 已發送爆擊流通知: {clean_pair} | 1H漲幅 {info['gain_1h_pct']:+.2f}% | 觸發 {info['trigger_count_1h']} 次 {info['stars']}")
+            print(f"🚨 已發送 MEXC 爆擊流通知: {clean_pair} | 1H漲幅 {info['gain_1h_pct']:+.2f}% | 觸發 {info['trigger_count_1h']} 次 {info['stars']}")
         else:
             print(f"❌ Discord 發送失敗 ({resp.status_code}): {resp.text}")
     except Exception as e:
@@ -488,25 +477,29 @@ def send_burst_discord_alert(info: dict, df_1h: pd.DataFrame, df_3m: pd.DataFram
 
 
 # ==========================================
-# 8. 全市場合約 3 分鐘異常脈衝掃描主流程
+# 7. MEXC 全市場永續合約掃描主流程
 # ==========================================
 def run_burst_scan():
-    exchange = ccxt.okx({"enableRateLimit": True})
+    exchange = ccxt.mexc({
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},
+    })
     state = load_state()
     trigger_ts_map = state["trigger_timestamps"]
     alert_hist = state["alert_history"]
     prev_tickers = state["prev_tickers"]
+    oi_baseline = state["oi_baseline"]
     now = time.time()
 
-    # 1. 一次取得全市場 OKX USDT 永續合約即時報價
-    swap_tickers = exchange.fetch_tickers(params={"instType": "SWAP"})
+    # 1. 一次抓取全市場 MEXC USDT 永續合約即時行情（含持倉量 holdVol 與資金費率）
+    swap_tickers = exchange.fetch_tickers()
     shortlist = []
 
     for sym, t in swap_tickers.items():
         if not sym.endswith("/USDT:USDT"):
             continue
         base = sym.split("/")[0]
-        if is_excluded_base(base):
+        if base in BLACKLIST_BASE:
             continue
 
         last_p = float(t.get("last") or 0)
@@ -514,39 +507,55 @@ def run_burst_scan():
             continue
 
         info_raw = t.get("info", {})
-        inst_id = info_raw.get("instId", f"{base}-USDT-SWAP")
-        vol_24h_u = float(info_raw.get("volCcy24h") or 0) * last_p
-        pct_24h = float(t.get("percentage") or 0)
+        mexc_pair = info_raw.get("symbol", f"{base}_USDT")
+        turnover_24h = float(info_raw.get("amount24") or t.get("quoteVolume") or 0)
+        if turnover_24h == 0:
+            turnover_24h = float(t.get("baseVolume") or 0) * last_p
 
-        # 過濾掉完全沒流動性的死幣（24H 成交額至少 80 萬 U）
-        if vol_24h_u < 800_000:
+        if turnover_24h < MIN_24H_TURNOVER_USDT:
             continue
 
-        # 與上一輪（約3~5分鐘前）價格/成交額比對，抓出瞬間異動
+        pct_24h = float(t.get("percentage") or 0)
+        cur_oi = float(info_raw.get("holdVol") or 0)
+        fr_raw = info_raw.get("fundingRate")
+        funding_pct = float(fr_raw) * 100.0 if fr_raw is not None else None
+
+        # 計算短線急拉幅度
         prev_rec = prev_tickers.get(sym)
         short_jump_pct = 0.0
         if prev_rec and (now - prev_rec["ts"]) <= 900 and prev_rec["price"] > 0:
             short_jump_pct = (last_p - prev_rec["price"]) / prev_rec["price"] * 100.0
+        prev_tickers[sym] = {"price": last_p, "oi": cur_oi, "ts": now}
 
-        prev_tickers[sym] = {"price": last_p, "vol": vol_24h_u, "ts": now}
+        # 維護約 30 分鐘持倉量 (OI) 基線，用來偵測異常增倉
+        base_rec = oi_baseline.get(sym)
+        oi_chg_pct = None
+        if cur_oi > 0:
+            if not base_rec or (now - base_rec["ts"]) >= 2400:
+                oi_baseline[sym] = {"oi": cur_oi, "ts": now}
+            elif base_rec["oi"] > 0:
+                oi_chg_pct = (cur_oi - base_rec["oi"]) / base_rec["oi"] * 100.0
 
-        # 初篩進入精細 K 線掃描池：24H 漲幅 > 4% 或 剛出現短線急拉 > 1.0%
+        # 初篩進入精細 K 線分析池：24H 漲幅 >= 4% 或剛出現短線急拉 >= 1.0%
         if pct_24h >= 4.0 or short_jump_pct >= 1.0:
-            shortlist.append((sym, inst_id, max(pct_24h, short_jump_pct * 5)))
+            shortlist.append((sym, mexc_pair, max(pct_24h, short_jump_pct * 5), oi_chg_pct, funding_pct))
 
     shortlist.sort(key=lambda x: x[2], reverse=True)
-    # 掃描最活躍的前 35 檔合約的 3m / 15m / 1h K 線
-    top_active = shortlist[:35]
+    # 掃描最活躍的前 40 檔 MEXC 異動合約
+    top_active = shortlist[:40]
     all_analyzed = []
 
-    for sym, inst_id, _ in top_active:
+    for sym, mexc_pair, _, oi_chg_pct, funding_pct in top_active:
         try:
-            ohlcv_3m = exchange.fetch_ohlcv(sym, "3m", limit=55)
-            if len(ohlcv_3m) < 30:
+            # 抓取 150 根 1m K 線，即時合成 50 根標準 3m K 線
+            ohlcv_1m = exchange.fetch_ohlcv(sym, "1m", limit=150)
+            if len(ohlcv_1m) < 90:
                 continue
-            df_3m = compute_burst_indicators(pd.DataFrame(ohlcv_3m, columns=["ts", "open", "high", "low", "close", "volume"]))
+            df_3m = compute_burst_indicators(resample_1m_to_3m(ohlcv_1m))
+            if len(df_3m) < 25:
+                continue
 
-            # 檢查最新兩根已走/在走 3m K 線是否出現「短線異常脈衝」
+            # 檢查最新兩根 3m K 線是否出現「短線異常脈衝」
             c_now = df_3m.iloc[-1]
             c_prev = df_3m.iloc[-2]
             gain_3m_now = (float(c_now["close"]) - float(c_now["open"])) / float(c_now["open"]) * 100.0
@@ -563,13 +572,12 @@ def run_burst_scan():
 
             ts_list = [t for t in trigger_ts_map.get(sym, []) if now - t <= 3600]
             if is_pulse:
-                # 避免同一根 3m K 線在 150 秒內重複計數
                 if not ts_list or (now - ts_list[-1]) >= 150:
                     ts_list.append(now)
             trigger_ts_map[sym] = ts_list
             count_1h = len(ts_list)
 
-            # 抓 1H 與 15m K 線進行結構體檢
+            # 抓 1H 與 15m K 線進行實體真漲與支撐體檢
             ohlcv_1h = exchange.fetch_ohlcv(sym, "1h", limit=50)
             ohlcv_15m = exchange.fetch_ohlcv(sym, "15m", limit=40)
             if len(ohlcv_1h) < 25 or len(ohlcv_15m) < 25:
@@ -578,14 +586,13 @@ def run_burst_scan():
             df_1h = compute_burst_indicators(pd.DataFrame(ohlcv_1h, columns=["ts", "open", "high", "low", "close", "volume"]))
             df_15m = compute_burst_indicators(pd.DataFrame(ohlcv_15m, columns=["ts", "open", "high", "low", "close", "volume"]))
 
-            info = analyze_burst_coin(sym, inst_id, df_3m, df_15m, df_1h, count_1h)
+            info = analyze_burst_coin(sym, mexc_pair, df_3m, df_15m, df_1h, count_1h, oi_chg_pct, funding_pct)
             all_analyzed.append((info, df_1h, df_3m))
 
-            # 判斷是否達到通知門檻（1H漲幅 >= 10% 且 1H觸發次數 >= 3次出星星）
+            # 達到通知門檻（1H漲幅 >= 10% 且 1H觸發次數 >= 3次出星星）
             if info["gain_1h_pct"] >= MIN_1H_GAIN_PCT and count_1h >= MIN_1H_TRIGGER_COUNT:
                 hist = alert_hist.get(sym, {"last_alert_ts": 0, "last_alert_count": 0})
                 mins_since_last = (now - hist["last_alert_ts"]) / 60.0
-                # 首次達 3 次出星、或觸發次數再增加 >= 3 次、或距離上次播報滿 20 分鐘才再次推播（防洗版）
                 if mins_since_last >= 20 or (count_1h - hist["last_alert_count"]) >= 3:
                     send_burst_discord_alert(info, df_1h, df_3m)
                     alert_hist[sym] = {"last_alert_ts": now, "last_alert_count": count_1h}
@@ -594,16 +601,16 @@ def run_burst_scan():
             print(f"[跳過] {sym}: {e}")
 
     all_analyzed.sort(key=lambda x: (x[0]["trigger_count_1h"], x[0]["gain_1h_pct"]), reverse=True)
-    print(f"⚡ [{now_tw_str()}] 爆擊流掃描完成（精細掃描 {len(top_active)} 檔異動合約），當前異動排行 Top 5：")
+    print(f"⚡ [{now_tw_str()}] MEXC 爆擊流掃描完成（精細掃描 {len(top_active)} 檔異動合約），當前異動排行 Top 5：")
     for inf, _, _ in all_analyzed[:5]:
         print(
-            f"   • {inf['inst_id']:<18} | 1H漲幅: {inf['gain_1h_pct']:+6.2f}% | "
+            f"   • {inf['mexc_pair']:<14} | 1H漲幅: {inf['gain_1h_pct']:+6.2f}% | "
             f"1H觸發: {inf['trigger_count_1h']:2d}次 {inf['stars']:<2} | 現價: {format_price(inf['trigger_price'])}"
         )
 
     if FORCE_TEST and all_analyzed:
         top_info, top_1h, top_3m = all_analyzed[0]
-        print("🧪 手動測試觸發：強制發送當前異動最強合約預覽卡片...")
+        print("🧪 手動測試觸發：強制發送當前 MEXC 異動最強合約預覽卡片...")
         send_burst_discord_alert(top_info, top_1h, top_3m)
 
     save_state(state)
