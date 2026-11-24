@@ -1,0 +1,52 @@
+name: Burst Sniper Radar
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_test:
+        description: "強制發送一張當前異動最強合約測試卡片？(true / false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: burst-sniper-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan-burst:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 檢出倉庫程式碼
+        uses: actions/checkout@v4
+
+      - name: 2. 設定 Python 環境與套件快取
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 3. 安裝依賴套件
+        run: pip install -r requirements.txt
+
+      - name: 4. 執行全市場 3m 異常上漲脈衝掃描
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORCE_TEST: ${{ github.event.inputs.force_test || 'false' }}
+        run: python burst_bot.py
+
+      - name: 5. 保存 1 小時觸發計數器狀態 (burst_state.json)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add burst_state.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update burst trigger counts"
+            git pull --rebase origin main || true
+            git push
+          fi
